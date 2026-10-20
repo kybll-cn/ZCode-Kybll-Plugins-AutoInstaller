@@ -1,0 +1,11 @@
+# 仓库默认按文本处理，避免 CRLF/LF 在各平台间互相污染。
+* text=auto
+
+# .bat 必须保持 CRLF：cmd.exe 无法解析 LF 换行的批处理文件。
+*.bat text eol=crlf
+
+# 源码统一 LF
+*.cs  text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+*.json text eol=lf
