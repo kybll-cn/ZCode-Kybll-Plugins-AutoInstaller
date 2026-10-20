@@ -51,9 +51,9 @@ internal static class Program
     {
         new PluginSpec {
             Name = "Zcode-Status-TypeBar",
-            Version = "1.1.0",
-            Url = "https://cnb.cool/kybll/Zcode-Status-TypeBar/-/releases/download/v1.1.0/Zcode-Status-TypeBar-v1.1.0.zip",
-            Sha256 = "d69b8bacdeeb3a9a20cd65772dec0de39abeb0d531656dad44b71c4a2339e526",
+            Version = "1.1.1",
+            Url = "https://cnb.cool/kybll/Zcode-Status-TypeBar/-/releases/download/v1.1.1/Zcode-Status-TypeBar-v1.1.1.zip",
+            Sha256 = "ef2447d58bba49c39f116e3d7a3ac1a143c3b3c8ce00d3133c1cdd23ddddb8a3",
             IsAsar = true,
         },
         new PluginSpec {
