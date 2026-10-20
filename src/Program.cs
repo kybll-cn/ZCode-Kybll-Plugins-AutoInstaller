@@ -87,6 +87,8 @@ internal static class Program
         /* --dry-run：只走完"找 Python / 找 ZCode / 下载校验解压"，
          * 不等进程、不改 app.asar、不装任何东西。用来验证下载链路。 */
         bool dryRun = Array.IndexOf(args, "--dry-run") >= 0;
+        /* --zcode-dir <路径>：手动指定 ZCode 安装目录，定位失败时的兜底。 */
+        string zcodeDirArg = GetArgValue(args, "--zcode-dir");
 
         Say("==================================================");
         Say("  ZCode 插件一键安装器");
@@ -108,16 +110,36 @@ internal static class Program
         }
         Say("[1/5] Python: " + python);
 
-        /* 2. 找 ZCode */
-        string zcodeExe = FindZCode();
-        if (zcodeExe == null)
+        /* 2. 找 ZCode —— 定位要稳，因为别人的机器上安装路径、用户名都可能不同。
+         * 手动指定（--zcode-dir）优先于自动探测：用户明确说了在哪，就听用户的。 */
+        ZCodeInfo zc = null;
+        if (zcodeDirArg != null)
         {
-            Say("[x] 没有找到 ZCode.exe。");
-            Say("    请确认已安装 ZCode 桌面客户端。");
+            zc = MakeZCodeInfo(Path.Combine(zcodeDirArg, "ZCode.exe"), "命令行指定");
+            if (zc == null)
+                Say("      [x] 指定的目录里找不到 ZCode.exe 或 resources\\app.asar: " + zcodeDirArg);
+        }
+        if (zc == null) zc = FindZCode();
+        if (zc == null)
+        {
+            Say("[x] 没有找到 ZCode。");
+            Say("");
+            Say("    试过的位置：");
+            Say("      · 正在运行的 ZCode 进程");
+            Say("      · 桌面与开始菜单里的 ZCode 快捷方式");
+            Say("      · 卸载注册表项");
+            Say("      · 常见的默认安装目录");
+            Say("      · 全盘按 resources\\app.asar 特征扫描");
+            Say("");
+            Say("    如果 ZCode 装在非常规位置，可以把安装目录作为参数传进来：");
+            Say("      Install-ZCode-Plugins.exe --zcode-dir \"D:\\Apps\\ZCode\"");
             Finish(2);
             return 2;
         }
-        Say("[2/5] ZCode: " + zcodeExe);
+        Say("[2/5] ZCode: " + zc.ExePath);
+        Say("      定位方式: " + zc.Source);
+        Say("      app.asar: " + zc.AsarPath);
+        Say("      zcode CLI: " + zc.CliPath);
 
         /* 3. 下载并校验三个插件包 */
         string workDir = Path.Combine(
@@ -193,7 +215,7 @@ internal static class Program
         /* 5.1 TypeBar：状态条 + 注册 MCP 工具 token_usage */
         Say("");
         Say("  (1/3) Zcode-Status-TypeBar v" + PLUGINS[0].Version + " —— token 用量状态条");
-        if (!RunAsarInstaller(python, extracted["Zcode-Status-TypeBar"], "--force"))
+        if (!RunAsarInstaller(python, extracted["Zcode-Status-TypeBar"], "--force", zc.AsarPath))
         {
             Say("      [x] 失败");
             failures++;
@@ -204,7 +226,7 @@ internal static class Program
          * UTF-8（外层控制台是 GBK 时中文提示才不乱码）。 */
         Say("");
         Say("  (2/3) Zcode-Status-Daily-Use v" + PLUGINS[1].Version + " —— 设置页「今日用量」");
-        if (!RunAsarInstaller(python, extracted["Zcode-Status-Daily-Use"], "--standalone"))
+        if (!RunAsarInstaller(python, extracted["Zcode-Status-Daily-Use"], "--standalone", zc.AsarPath))
         {
             Say("      [x] 失败");
             failures++;
@@ -214,7 +236,8 @@ internal static class Program
          * 已经装好且启用时 zcode CLI 会报 already installed，那不算失败。 */
         Say("");
         Say("  (3/3) ZCode-Search-Aggregation v" + PLUGINS[2].Version + " —— 多引擎并行搜索");
-        if (!InstallSearchPlugin(extracted["ZCode-Search-Aggregation"]))
+        string mktDir = Path.Combine(workDir, "marketplace");
+        if (!InstallSearchPlugin(extracted["ZCode-Search-Aggregation"], zc, mktDir))
         {
             Say("      [x] 失败");
             failures++;
@@ -235,7 +258,7 @@ internal static class Program
             if (!noRestart)
             {
                 Say("  正在启动 ZCode...");
-                StartZCode(zcodeExe);
+                StartZCode(zc.ExePath);
                 Say("  已启动。");
             }
             else
@@ -254,7 +277,7 @@ internal static class Program
             Say("    · ZCode 没完全退出（托盘进程还在）→ 完全退出后重跑本 exe");
             Say("    · app.asar 所在目录不可写 → 用管理员身份运行本 exe");
             Say("    · 上次安装有残留 → 先跑各插件的 uninstall.bat 再重跑");
-            if (!noRestart) StartZCode(zcodeExe);
+            if (!noRestart) StartZCode(zc.ExePath);
             Finish(1);
             return 1;
         }
@@ -262,13 +285,19 @@ internal static class Program
 
     /* ---------------------------------------------------------------- 下载 */
 
-    /* 下载（或复用已下载的）zip，校验 SHA256，解压到独立目录 */
+    /* 下载（或复用已下载的）zip，校验 SHA256，解压并定位真正的插件根目录。
+     *
+     * 解压后不能直接用解压目录当插件目录：release 的 zip 里有一层顶层目录
+     * （Zcode-Status-TypeBar/install.py），而插件的 install.py 在里面一层。
+     * 早先直接找 <解压目录>\install.py，自然找不到 —— 报"包里没有 install.py"。
+     * 所以这里探测实际根目录：候选里看谁有 install.py / .zcode-plugin。
+     */
     private static bool FetchPlugin(PluginSpec p, string workDir, bool offline, out string outDir)
     {
         outDir = null;
         string fileName = p.Name + "-v" + p.Version + ".zip";
         string zipPath = Path.Combine(workDir, fileName);
-        outDir = Path.Combine(workDir, p.Name + "-v" + p.Version);
+        string extractDir = Path.Combine(workDir, p.Name + "-v" + p.Version);
 
         if (File.Exists(zipPath))
         {
@@ -276,7 +305,7 @@ internal static class Program
             if (have == p.Sha256)
             {
                 Say("      " + p.Name + " v" + p.Version + "：已有缓存，哈希一致");
-                if (ExtractZip(zipPath, outDir)) return true;
+                if (ExtractAndLocate(zipPath, extractDir, p, out outDir)) return true;
             }
             else
             {
@@ -307,8 +336,53 @@ internal static class Program
         }
         Say("      校验通过 (" + new FileInfo(zipPath).Length + " 字节)");
 
-        if (!ExtractZip(zipPath, outDir)) return false;
+        return ExtractAndLocate(zipPath, extractDir, p, out outDir);
+    }
+
+    /* 解压 + 定位插件根目录 */
+    private static bool ExtractAndLocate(string zipPath, string extractDir, PluginSpec p, out string pluginRoot)
+    {
+        pluginRoot = null;
+        if (!ExtractZip(zipPath, extractDir)) return false;
+
+        pluginRoot = LocatePluginRoot(extractDir, p);
+        if (pluginRoot == null)
+        {
+            Say("      [x] 解压后找不到插件根目录（既没有 install.py 也没有 .zcode-plugin）");
+            return false;
+        }
+        /* 顶层多了一层目录时提一句，方便排障 */
+        if (!string.Equals(pluginRoot, extractDir, StringComparison.OrdinalIgnoreCase))
+            Say("      插件根目录: " + Path.GetFileName(pluginRoot));
         return true;
+    }
+
+    /* 在解压目录里找真正的插件根目录。
+     * 判据是"这个目录看起来像一个插件"：有 install.py（asar 插件）
+     * 或有 .zcode-plugin\plugin.json（原生插件）。
+     * 先看自己，再看一层子目录。 */
+    private static string LocatePluginRoot(string extractDir, PluginSpec p)
+    {
+        if (LooksLikePluginDir(extractDir)) return extractDir;
+        try
+        {
+            foreach (var d in Directory.GetDirectories(extractDir))
+                if (LooksLikePluginDir(d)) return d;
+        }
+        catch { }
+        return null;
+    }
+
+    private static bool LooksLikePluginDir(string dir)
+    {
+        try
+        {
+            if (File.Exists(Path.Combine(dir, "install.py"))) return true;
+            if (File.Exists(Path.Combine(dir, ".zcode-plugin", "plugin.json"))) return true;
+            if (File.Exists(Path.Combine(dir, "package.json"))) return true;
+        }
+        catch { }
+        return false;
     }
 
     private static bool DownloadFile(string url, string dest)
@@ -381,8 +455,10 @@ internal static class Program
 
     /* ---------------------------------------------------------------- 安装 */
 
-    /* 跑一个插件的 install.py，把它的输出原样透出 */
-    private static bool RunAsarInstaller(string python, string pkgDir, string flag)
+    /* 跑一个插件的 install.py，把它的输出原样透出。
+     * asarPath 显式传过去 —— 不让插件自己猜安装在哪儿，它那套猜测逻辑
+     * 只覆盖默认路径，别人机器上装在 D 盘就找不到。 */
+    private static bool RunAsarInstaller(string python, string pkgDir, string flag, string asarPath)
     {
         string script = Path.Combine(pkgDir, "install.py");
         if (!File.Exists(script))
@@ -393,7 +469,7 @@ internal static class Program
         var psi = new ProcessStartInfo
         {
             FileName = python,
-            Arguments = "\"install.py\" " + flag,
+            Arguments = "\"install.py\" " + flag + " --asar \"" + asarPath + "\"",
             WorkingDirectory = pkgDir,
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -423,11 +499,19 @@ internal static class Program
     }
 
     /* 搜索插件：原生插件，用 zcode CLI 装。
-     * zcode.cjs 在 resources/glm 下，需要 node。 */
-    private static bool InstallSearchPlugin(string pkgDir)
+     *
+     * zcode CLI 的 marketplace 机制：marketplace 是一个**目录**，里面要有
+     * marketplace.json，条目里的 source 是**相对于该目录**的路径。
+     * 所以这里现搭一个 marketplace 目录：把三个插件都放进去，再写一份
+     * marketplace.json 指向搜索插件。
+     *
+     * 早先直接拿插件目录当 marketplace 用会报
+     * "Marketplace manifest not found in directory" —— 目录里没有 marketplace.json。
+     * 之前还指向本机的 D:\Project\ZCode-Plugins（开发目录），换台机器就没有了。
+     */
+    private static bool InstallSearchPlugin(string pkgDir, ZCodeInfo zc, string marketplaceDir)
     {
-        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        string zcodeCjs = Path.Combine(local, @"Programs\ZCode\resources\glm\zcode.cjs");
+        string zcodeCjs = zc.CliPath;
         if (!File.Exists(zcodeCjs))
         {
             Say("      [x] 找不到 zcode.cjs: " + zcodeCjs);
@@ -437,6 +521,7 @@ internal static class Program
         if (node == null)
         {
             Say("      [x] 找不到 node.exe，无法调用 zcode CLI");
+            Say("          ZCode 自带 node，但它不在 PATH 上。");
             return false;
         }
 
@@ -448,13 +533,21 @@ internal static class Program
             return true;
         }
 
-        /* 装。marketplace 指向插件根目录（zip 解压出来的那个目录），
-         * 需要先确保 marketplace 已注册。 */
-        var mkt = RunCapture(node, zcodeCjs, "plugins", "marketplace", "list");
-        if (mkt.ExitCode == 0 && !mkt.Output.Contains("dev-zcode-plugins"))
+        /* 现搭 marketplace 目录 */
+        if (!BuildMarketplace(marketplaceDir, pkgDir))
         {
-            Say("      注册 marketplace dev-zcode-plugins...");
-            var add = RunCapture(node, zcodeCjs, "plugins", "marketplace", "add", pkgDir);
+            Say("      [x] 搭建 marketplace 目录失败");
+            return false;
+        }
+        Say("      marketplace 目录: " + marketplaceDir);
+
+        const string mktName = "zcode-auto-installer";
+        var mkt = RunCapture(node, zcodeCjs, "plugins", "marketplace", "list");
+        bool haveMkt = mkt.ExitCode == 0 && mkt.Output.Contains(mktName);
+        if (!haveMkt)
+        {
+            Say("      注册 marketplace " + mktName + "...");
+            var add = RunCapture(node, zcodeCjs, "plugins", "marketplace", "add", marketplaceDir);
             if (add.ExitCode != 0)
             {
                 Say("      [x] 注册 marketplace 失败");
@@ -464,7 +557,8 @@ internal static class Program
             }
         }
 
-        var r = RunCapture(node, zcodeCjs, "plugins", "install", "zcode-search-aggregation");
+        var r = RunCapture(node, zcodeCjs, "plugins", "install",
+            "zcode-search-aggregation@" + mktName);
         foreach (var line in r.Output.Replace("\r\n", "\n").Split('\n'))
             if (line.Trim().Length > 0) Say("      " + line.TrimEnd());
         if (r.ExitCode != 0)
@@ -476,12 +570,67 @@ internal static class Program
         return true;
     }
 
+    /* 搭一个 marketplace 目录：搜索插件放进去 + 一份 marketplace.json。
+     * source 用相对路径（相对 marketplace 目录），CLI 会按这个解析。 */
+    private static bool BuildMarketplace(string mktDir, string searchPluginDir)
+    {
+        try
+        {
+            if (Directory.Exists(mktDir)) Directory.Delete(mktDir, true);
+            Directory.CreateDirectory(mktDir);
+
+            /* 把插件目录整个拷进去（插件名作为子目录） */
+            string dest = Path.Combine(mktDir, "ZCode-Search-Aggregation");
+            CopyDirectory(searchPluginDir, dest);
+
+            string json = "{\n"
+                + "  \"name\": \"zcode-auto-installer\",\n"
+                + "  \"plugins\": [\n"
+                + "    {\n"
+                + "      \"name\": \"zcode-search-aggregation\",\n"
+                + "      \"source\": \"./ZCode-Search-Aggregation\",\n"
+                + "      \"version\": \"1.0.0\",\n"
+                + "      \"description\": \"Parallel multi-engine web search for ZCode: Baidu, Bing, 360, Sogou, GitHub, Google, Yahoo and DuckDuckGo in one call, deduped and grouped, with automatic mainland-only fallback when the global internet is unreachable.\"\n"
+                + "    }\n"
+                + "  ]\n"
+                + "}\n";
+            File.WriteAllText(Path.Combine(mktDir, "marketplace.json"), json, new UTF8Encoding(false));
+            return true;
+        }
+        catch (Exception e)
+        {
+            Say("      [x] " + e.Message);
+            return false;
+        }
+    }
+
+    private static void CopyDirectory(string src, string dest)
+    {
+        Directory.CreateDirectory(dest);
+        foreach (var f in Directory.GetFiles(src))
+            File.Copy(f, Path.Combine(dest, Path.GetFileName(f)), true);
+        foreach (var d in Directory.GetDirectories(src))
+            CopyDirectory(d, Path.Combine(dest, Path.GetFileName(d)));
+    }
+
     /* ---------------------------------------------------------------- 工具 */
 
     private static void Say(string s)
     {
         Console.WriteLine(s);
         Log.Add(s);
+    }
+
+    /* 取命令行参数的值。写成 --name value 或 --name=value 都认。 */
+    private static string GetArgValue(string[] args, string name)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == name && i + 1 < args.Length) return args[i + 1];
+            if (args[i].StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
+                return args[i].Substring(name.Length + 1);
+        }
+        return null;
     }
 
     private static void Finish(int code)
@@ -548,20 +697,317 @@ internal static class Program
         return r.ExitCode == 0;
     }
 
-    private static string FindZCode()
+    /* ---------------------------------------------------------------- 定位 ZCode */
+
+    /* 定位结果。Dir 是安装目录（ZCode.exe 与 resources\ 都在它下面）。 */
+    private class ZCodeInfo
     {
-        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var candidates = new[]
+        public string Dir;        // 安装目录
+        public string ExePath;    // ZCode.exe
+        public string AsarPath;   // <Dir>\resources\app.asar
+        public string CliPath;    // <Dir>\resources\glm\zcode.cjs
+        public string Source;     // 是怎么找到的（写给用户看）
+    }
+
+    /* 定位 ZCode 安装目录。
+     *
+     * 为什么不能只查默认路径：目标机器上用户名、盘符、装法都可能不同 ——
+     * 装在 D 盘、用 zip 免安装、装在 Program Files、公司统一部署到某个目录。
+     * 所以这里按可靠性从高到低试多个来源，且每个来源都靠"特征"确认
+     * （目录里确实有 resources\app.asar），而不是靠名字猜。
+     *
+     * 来源顺序：
+     *   1. 正在运行的 ZCode 进程的可执行文件路径 —— 最准，进程跑着就说明装在这
+     *   2. 桌面 / 开始菜单 / 公共目录里的快捷方式目标
+     *   3. 卸载注册表项（DisplayIcon / InstallLocation 里的路径）
+     *   4. 常见默认目录
+     *   5. 全盘按 resources\app.asar 特征找（慢，放最后）
+     */
+    private static ZCodeInfo FindZCode()
+    {
+        var results = new List<ZCodeInfo>();
+
+        /* 1. 运行中的进程 */
+        try
         {
-            Path.Combine(local, @"Programs\ZCode\ZCode.exe"),
-            Path.Combine(local, @"ZCode\ZCode.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"ZCode\ZCode.exe"),
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"ZCode\ZCode.exe"),
-        };
-        foreach (var c in candidates) if (File.Exists(c)) return c;
+            foreach (var p in Process.GetProcessesByName("ZCode"))
+            {
+                try
+                {
+                    string path = p.MainModule.FileName;
+                    var info = MakeZCodeInfo(path, "运行中的进程");
+                    if (info != null) results.Add(info);
+                }
+                catch { }
+                finally { try { p.Dispose(); } catch { } }
+            }
+        }
+        catch { }
+
+        /* 2. 快捷方式 */
+        foreach (var lnk in FindShortcuts())
+        {
+            string target = ResolveShortcut(lnk);
+            if (target == null) continue;
+            var info = MakeZCodeInfo(target, "快捷方式 " + lnk);
+            if (info != null) results.Add(info);
+        }
+
+        /* 3. 卸载注册表项 */
+        foreach (var path in FindRegistryPaths())
+        {
+            var info = MakeZCodeInfo(path, "卸载注册表项");
+            if (info != null) results.Add(info);
+        }
+
+        /* 4. 常见默认目录 */
+        foreach (var dir in DefaultZCodeDirs())
+        {
+            var info = MakeZCodeInfo(Path.Combine(dir, "ZCode.exe"), "默认安装目录");
+            if (info != null) results.Add(info);
+        }
+
+        /* 5. 全盘扫（慢，最后） */
+        foreach (var dir in ScanForZCode())
+        {
+            var info = MakeZCodeInfo(Path.Combine(dir, "ZCode.exe"), "全盘扫描");
+            if (info != null) results.Add(info);
+        }
+
+        /* 去重：同一个目录只留第一条（来源最可靠的那个） */
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var r in results)
+        {
+            if (seen.Add(r.Dir)) return r;
+        }
         return null;
     }
 
+    /* 确认这个 exe 确实是一个 ZCode 安装：同目录下必须有 resources\app.asar。
+     * 这一步是关键 —— 它把"名字叫 ZCode 的东西"和"真的 ZCode"区分开。 */
+    private static ZCodeInfo MakeZCodeInfo(string exePath, string source)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(exePath)) return null;
+            string full = Path.GetFullPath(exePath);
+            if (!File.Exists(full)) return null;
+            if (!string.Equals(Path.GetFileName(full), "ZCode.exe", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            string dir = Path.GetDirectoryName(full);
+            string asar = Path.Combine(dir, "resources", "app.asar");
+            if (!File.Exists(asar)) return null;
+
+            return new ZCodeInfo
+            {
+                Dir = dir,
+                ExePath = full,
+                AsarPath = asar,
+                CliPath = Path.Combine(dir, "resources", "glm", "zcode.cjs"),
+                Source = source,
+            };
+        }
+        catch { return null; }
+    }
+
+    /* 桌面 / 开始菜单 / 公共目录下的快捷方式 */
+    private static List<string> FindShortcuts()
+    {
+        var list = new List<string>();
+        try
+        {
+            var dirs = new List<string>();
+            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            string start = Environment.GetFolderPath(Environment.SpecialFolder.StartMenu);
+            string commonStart = Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu);
+            string commonDesktop = Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory);
+            if (desktop != null) dirs.Add(desktop);
+            if (start != null) dirs.Add(start);
+            if (commonStart != null) dirs.Add(commonStart);
+            if (commonDesktop != null) dirs.Add(commonDesktop);
+
+            foreach (var d in dirs)
+            {
+                if (!Directory.Exists(d)) continue;
+                try
+                {
+                    foreach (var f in Directory.GetFiles(d, "*.lnk", SearchOption.AllDirectories))
+                        list.Add(f);
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return list;
+    }
+
+    /* 读 .lnk 的目标路径。用 WScript.Shell COM —— 系统自带，不需要额外依赖。
+     * 读不出来（比如快捷方式指向 UWP 应用）就返回 null。 */
+    private static string ResolveShortcut(string lnkPath)
+    {
+        try
+        {
+            Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType == null) return null;
+            object shell = Activator.CreateInstance(shellType);
+            try
+            {
+                object shortcut = shellType.InvokeMember("CreateShortcut",
+                    System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { lnkPath });
+                if (shortcut == null) return null;
+                try
+                {
+                    string target = shortcutTypeInvoke(shortcut, "TargetPath");
+                    if (!string.IsNullOrEmpty(target) && File.Exists(target)) return target;
+                }
+                finally { try { System.Runtime.InteropServices.Marshal.ReleaseComObject(shortcut); } catch { } }
+            }
+            finally { try { System.Runtime.InteropServices.Marshal.ReleaseComObject(shell); } catch { } }
+        }
+        catch { }
+        return null;
+    }
+
+    private static string shortcutTypeInvoke(object shortcut, string prop)
+    {
+        try
+        {
+            return (string)shortcut.GetType().InvokeMember(prop,
+                System.Reflection.BindingFlags.GetProperty, null, shortcut, null);
+        }
+        catch { return null; }
+    }
+
+    /* 卸载注册表项里的路径。
+     * InstallLocation 常常是空的，所以也看 DisplayIcon（形如 "C:\...\uninstallerIcon.ico,0"）。 */
+    private static List<string> FindRegistryPaths()
+    {
+        var paths = new List<string>();
+        var roots = new[]
+        {
+            @"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            @"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            @"HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        };
+        foreach (var root in roots)
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(root))
+                {
+                    var baseKey = key;
+                    if (baseKey == null)
+                    {
+                        try { baseKey = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(root); } catch { }
+                    }
+                    if (baseKey == null) continue;
+                    foreach (var sub in baseKey.GetSubKeyNames())
+                    {
+                        try
+                        {
+                            using (var sk = baseKey.OpenSubKey(sub))
+                            {
+                                if (sk == null) continue;
+                                object name = sk.GetValue("DisplayName");
+                                if (name == null || name.ToString().IndexOf("ZCode",
+                                        StringComparison.OrdinalIgnoreCase) < 0) continue;
+                                object loc = sk.GetValue("InstallLocation");
+                                if (loc != null && !string.IsNullOrEmpty(loc.ToString()))
+                                    paths.Add(loc.ToString());
+                                object icon = sk.GetValue("DisplayIcon");
+                                if (icon != null)
+                                {
+                                    string s = icon.ToString();
+                                    int comma = s.LastIndexOf(',');
+                                    if (comma > 0) s = s.Substring(0, comma);
+                                    s = s.Trim('"');
+                                    if (s.Length > 0)
+                                        paths.Add(Path.GetDirectoryName(s));
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+        return paths;
+    }
+
+    /* 常见默认安装目录。全部用 Environment 取，不写死用户名。 */
+    private static List<string> DefaultZCodeDirs()
+    {
+        var dirs = new List<string>();
+        try
+        {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+            string programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            dirs.Add(Path.Combine(local, @"Programs\ZCode"));
+            dirs.Add(Path.Combine(local, @"ZCode"));
+            dirs.Add(Path.Combine(programFiles, @"ZCode"));
+            dirs.Add(Path.Combine(programFilesX86, @"ZCode"));
+        }
+        catch { }
+        return dirs;
+    }
+
+    /* 全盘按 resources\app.asar 特征找。
+     * 慢（要遍历目录树），所以只在前面几个来源都没命中时才跑。
+     * 只看名字像安装目录的（ZCode / zcode），且限制深度 4 层 ——
+     * 装得再深的应用通常也不会超过这个数。 */
+    private static List<string> ScanForZCode()
+    {
+        var found = new List<string>();
+        try
+        {
+            foreach (var dr in DriveInfo.GetDrives())
+            {
+                if (!dr.IsReady) continue;
+                string root = dr.RootDirectory.FullName;
+                if (root.StartsWith(@"\\")) continue;   // 跳过网络盘，太慢
+                try
+                {
+                    foreach (var d in ScanDirs(root, 0, 4))
+                    {
+                        string name = Path.GetFileName(d);
+                        if (!name.Equals("ZCode", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (File.Exists(Path.Combine(d, "resources", "app.asar")))
+                        {
+                            found.Add(d);
+                            if (found.Count >= 3) return found;
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return found;
+    }
+
+    /* 按层数限制地收集目录名（不是所有子目录，是名字像安装目录的那些） */
+    private static List<string> ScanDirs(string dir, int depth, int maxDepth)
+    {
+        var result = new List<string>();
+        if (depth > maxDepth) return result;
+        string[] subs;
+        try { subs = Directory.GetDirectories(dir); }
+        catch { return result; }
+        foreach (var s in subs)
+        {
+            string name = Path.GetFileName(s);
+            if (name.StartsWith("$", StringComparison.Ordinal)) continue;   // 跳过系统目录
+            if (name.Equals("Windows", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Program Files (x86)", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("node_modules", StringComparison.OrdinalIgnoreCase)) continue;
+            result.Add(s);
+            result.AddRange(ScanDirs(s, depth + 1, maxDepth));
+        }
+        return result;
+    }
     private static string Which(string exe)
     {
         var path = Environment.GetEnvironmentVariable("PATH") ?? "";
